@@ -1,170 +1,122 @@
+# Base image
 FROM ubuntu:22.04
 
+# Environment variables
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PANEL_PORT=8080
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ENV PATH=$JAVA_HOME/bin:$PATH
 
-# Instala dependências
+# Install dependencies
 RUN apt-get update && apt-get install -y \
-    curl wget git unzip nano python3 python3-pip \
-    openjdk-8-jdk openjdk-11-jdk openjdk-17-jdk openjdk-21-jdk \
-    nodejs npm nginx supervisor sudo unzip \
+    openjdk-17-jdk openjdk-19-jdk openjdk-20-jdk \
+    php8.2-cli php8.2-fpm php8.2-mbstring php8.2-xml php8.2-bcmath php8.2-curl php8.2-gd php8.2-sqlite3 \
+    nginx supervisor curl unzip wget git \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Criação de diretórios
-WORKDIR /app
-RUN mkdir -p /app/backend /app/frontend /servers
+# Set working directory
+WORKDIR /opt/minecraft-panel
 
-# Backend Python
-RUN pip3 install --no-cache-dir fastapi uvicorn psutil python-multipart
+# Create basic HTML/CSS/JS panel with 3 sidebars
+RUN mkdir -p /opt/minecraft-panel/public && \
+    echo '<!DOCTYPE html>\
+<html lang="en">\
+<head>\
+<meta charset="UTF-8">\
+<meta name="viewport" content="width=device-width, initial-scale=1.0">\
+<title>Minecraft Panel</title>\
+<style>\
+body { margin:0; font-family:sans-serif; display:flex; height:100vh; }\
+.navbar, .sidebar, .sidebar2 { width:200px; background:#222; color:white; padding:10px; }\
+.main { flex:1; padding:10px; overflow:auto; background:#f4f4f4; }\
+a { color:white; text-decoration:none; display:block; margin:5px 0; }\
+button { margin:5px; }\
+</style>\
+</head>\
+<body>\
+<div class="navbar"><h3>Menu</h3><a href=\"#\">Dashboard</a><a href=\"#\">Servers</a></div>\
+<div class="sidebar"><h4>Servers</h4><div id="server-list"></div></div>\
+<div class="sidebar2"><h4>Actions</h4><button onclick="startServer()">Start</button><button onclick="stopServer()">Stop</button></div>\
+<div class="main"><h2>Server Status</h2><pre id="status">Loading...</pre></div>\
+<script>\
+function updateStatus() {\
+  fetch("/status.php").then(r=>r.text()).then(t=>document.getElementById("status").innerText=t);\
+}\
+function startServer(){fetch("/action.php?action=start");updateStatus();}\
+function stopServer(){fetch("/action.php?action=stop");updateStatus();}\
+setInterval(updateStatus,2000);\
+updateStatus();\
+</script>\
+</body>\
+</html>' > /opt/minecraft-panel/public/index.html
 
-# Backend main.py
-RUN bash -c "cat <<'EOF' > /app/backend/main.py
-from fastapi import FastAPI, UploadFile, File
-import psutil, os, subprocess, socket
+# Create PHP backend to manage server
+RUN echo '<?php \
+$serverDir="/opt/minecraft-panel/server";\
+if(!file_exists($serverDir)){mkdir($serverDir,0777,true);}\
+if($_SERVER["REQUEST_URI"]=="/status.php"){\
+  $status=file_exists("$serverDir/server.pid")?"Online":"Offline";\
+  echo "Server status: $status";\
+  exit;\
+}\
+if($_SERVER["REQUEST_URI"]=="/action.php"){\
+  $action=$_GET["action"]??"";\
+  $pidFile="$serverDir/server.pid";\
+  if($action=="start" && !file_exists($pidFile)){\
+    $cmd="java -Xmx1024M -Xms512M -jar $serverDir/server.jar nogui & echo $! > $pidFile";\
+    shell_exec($cmd);\
+    echo "Server started";\
+  }\
+  if($action=="stop" && file_exists($pidFile)){\
+    $pid=file_get_contents($pidFile);\
+    shell_exec("kill $pid");\
+    unlink($pidFile);\
+    echo "Server stopped";\
+  }\
+  exit;\
+}\
+?>' > /opt/minecraft-panel/public/status.php
 
-app = FastAPI()
-servers = {}
-account_file = '/app/account.txt'
+# Create a dummy server jar placeholder
+RUN mkdir -p /opt/minecraft-panel/server && \
+    echo 'Placeholder for Minecraft server jar' > /opt/minecraft-panel/server/server.jar
 
-if not os.path.exists(account_file):
-    with open(account_file, 'w') as f:
-        f.write('admin:admin')
+# Configure PHP-FPM
+RUN sed -i 's/;cgi.fix_pathinfo=1/cgi.fix_pathinfo=0/' /etc/php/8.2/fpm/php.ini
 
-def get_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(('8.8.8.8', 80))
-        return s.getsockname()[0]
-    except:
-        return '127.0.0.1'
-    finally:
-        s.close()
+# Configure nginx
+RUN rm /etc/nginx/sites-enabled/default && \
+    echo 'server { \
+        listen 8080; \
+        server_name localhost; \
+        root /opt/minecraft-panel/public; \
+        index index.php index.html; \
+        location / { try_files $uri /index.php?$query_string; } \
+        location ~ \.php$ { include snippets/fastcgi-php.conf; fastcgi_pass unix:/var/run/php/php8.2-fpm.sock; } \
+        location ~ /\.ht { deny all; } \
+    }' > /etc/nginx/sites-available/panel.conf && \
+    ln -s /etc/nginx/sites-available/panel.conf /etc/nginx/sites-enabled/panel.conf
 
-@app.get('/')
-def root():
-    return {'status':'online','ip':get_ip()}
+# Supervisor config
+RUN echo '[supervisord] \
+nodaemon=true \
+[program:php-fpm] \
+command=/usr/sbin/php-fpm8.2 -F \
+autorestart=true \
+stdout_logfile=/var/log/php-fpm.log \
+stderr_logfile=/var/log/php-fpm.err \
+[program:nginx] \
+command=/usr/sbin/nginx -g "daemon off;" \
+autorestart=true \
+stdout_logfile=/var/log/nginx.log \
+stderr_logfile=/var/log/nginx.err' > /etc/supervisor/conf.d/supervisord.conf
 
-@app.get('/servers')
-def list_servers():
-    data = []
-    for name, proc in servers.items():
-        running = proc.poll() is None
-        data.append({
-            'name': name,
-            'running': running,
-            'cpu': psutil.cpu_percent(),
-            'ram': psutil.virtual_memory().percent
-        })
-    return data
+# Create entrypoint
+RUN echo '#!/bin/bash \
+exec /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.conf' > /entrypoint.sh && chmod +x /entrypoint.sh
 
-@app.post('/create/{name}')
-def create_server(name: str):
-    os.makedirs(f'/servers/{name}', exist_ok=True)
-    return {'created': name}
-
-@app.post('/start/{name}')
-def start_server(name: str):
-    jar_path = f'/servers/{name}/server.jar'
-    if not os.path.exists(jar_path):
-        return {'error':'server.jar not found'}
-    cmd = ['java','-Xmx2G','-Xms1G','-jar','server.jar','nogui']
-    proc = subprocess.Popen(cmd, cwd=f'/servers/{name}')
-    servers[name] = proc
-    return {'started': name}
-
-@app.post('/stop/{name}')
-def stop_server(name: str):
-    if name in servers:
-        servers[name].terminate()
-        return {'stopped': name}
-    return {'error':'server not running'}
-
-@app.post('/upload/{name}')
-async def upload_file(name: str, file: UploadFile = File(...)):
-    path = f'/servers/{name}/{file.filename}'
-    with open(path,'wb') as f:
-        f.write(await file.read())
-    return {'uploaded': file.filename}
-EOF"
-
-# Frontend index.html
-RUN bash -c "cat <<'EOF' > /app/frontend/index.html
-<!DOCTYPE html>
-<html>
-<head>
-<title>Minecraft Panel</title>
-<style>
-body {margin:0; font-family:Arial; display:flex;}
-.sidebar {width:200px; background:#1e1e2f; color:white; height:100vh; padding:10px;}
-.content {flex:1; padding:20px;}
-.card {background:#2e2e3f; color:white; padding:10px; margin:10px; border-radius:8px;}
-</style>
-</head>
-<body>
-<div class='sidebar'>Menu</div>
-<div class='sidebar'>Servers</div>
-<div class='sidebar'>Settings</div>
-<div class='content'>
-<h1>Painel Minecraft</h1>
-<div id='servers'></div>
-<div id='ip'></div>
-</div>
-<script>
-async function load(){
- let res = await fetch('/api/servers');
- let data = await res.json();
- let div = document.getElementById('servers');
- div.innerHTML='';
- data.forEach(s=>{
-   div.innerHTML += `<div class='card'>${s.name} - Online: ${s.running} - CPU: ${s.cpu}% - RAM: ${s.ram}%</div>`;
- });
- let ipres = await fetch('/api/');
- let ipdata = await ipres.json();
- document.getElementById('ip').innerText = 'IP: '+ipdata.ip;
-}
-load();
-</script>
-</body>
-</html>
-EOF"
-
-# Configura Nginx
-RUN rm /etc/nginx/sites-enabled/default
-RUN bash -c "cat <<'EOF' > /etc/nginx/sites-enabled/mcpanel
-server {
-    listen 8080;
-    location / {
-        root /app/frontend;
-        index index.html;
-    }
-    location /api/ {
-        proxy_pass http://127.0.0.1:8000/;
-    }
-}
-EOF"
-
-# Configura Supervisor
-RUN bash -c "cat <<'EOF' > /etc/supervisor/conf.d/supervisord.conf
-[supervisord]
-nodaemon=true
-
-[program:backend]
-command=uvicorn main:app --host 0.0.0.0 --port 8000
-directory=/app/backend
-autostart=true
-autorestart=true
-stdout_logfile=/var/log/backend.log
-stderr_logfile=/var/log/backend_err.log
-
-[program:nginx]
-command=nginx -g 'daemon off;'
-autostart=true
-autorestart=true
-stdout_logfile=/var/log/nginx.log
-stderr_logfile=/var/log/nginx_err.log
-EOF"
-
-# Porta do painel
+# Expose port
 EXPOSE 8080
 
-# Inicializa supervisor
-CMD ["/usr/bin/supervisord"]
+# Start container
+CMD ["/entrypoint.sh"]
