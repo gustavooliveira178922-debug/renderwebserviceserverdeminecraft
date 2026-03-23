@@ -1,82 +1,148 @@
-FROM openjdk:21-jdk-slim
+FROM ubuntu:22.04
 
-# Instalar dependências
-RUN apt update && apt install -y \
-    curl \
-    python3 \
-    && rm -rf /var/lib/apt/lists/*
+ENV DEBIAN_FRONTEND=noninteractive
 
-WORKDIR /minecraft
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    curl wget git unzip nano \
+    python3 python3-pip \
+    openjdk-8-jdk \
+    openjdk-11-jdk \
+    openjdk-17-jdk \
+    openjdk-21-jdk \
+    nodejs npm \
+    nginx \
+    supervisor \
+    && apt-get clean
 
-# Baixar PaperMC
-RUN curl -o server.jar https://api.papermc.io/v2/projects/paper/versions/1.20.4/builds/416/downloads/paper-1.20.4-416.jar
+# Create app directory
+WORKDIR /app
 
-# Aceitar EULA
-RUN echo "eula=true" > eula.txt
+# Backend (Python FastAPI)
+RUN pip3 install fastapi uvicorn psutil
 
-# Baixar playit
-RUN curl -L -o playit https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-linux-amd64 \
-    && chmod +x playit
+# Create backend
+RUN mkdir -p /app/backend
+RUN echo '
+from fastapi import FastAPI
+import psutil, os, subprocess
 
-# Criar script Python watchdog
-RUN echo '\
-import subprocess, time\n\
-\n\
-JAVA_FLAGS = [\n\
-"java",\n\
-"-Xms8G",\n\ 
-"-Xmx16G",\n\ 
-"-XX:+UseG1GC",\n\
-"-XX:+ParallelRefProcEnabled",\n\
-"-XX:MaxGCPauseMillis=200",\n\
-"-XX:+UnlockExperimentalVMOptions",\n\
-"-XX:+DisableExplicitGC",\n\
-"-XX:+AlwaysPreTouch",\n\
-"-XX:G1NewSizePercent=30",\n\
-"-XX:G1MaxNewSizePercent=40",\n\
-"-XX:G1HeapRegionSize=8M",\n\
-"-XX:G1ReservePercent=20",\n\
-"-XX:G1HeapWastePercent=5",\n\
-"-XX:G1MixedGCCountTarget=4",\n\
-"-XX:InitiatingHeapOccupancyPercent=15",\n\
-"-XX:G1MixedGCLiveThresholdPercent=90",\n\
-"-XX:G1RSetUpdatingPauseTimePercent=5",\n\
-"-XX:SurvivorRatio=32",\n\
-"-XX:+PerfDisableSharedMem",\n\
-"-XX:MaxTenuringThreshold=1",\n\
-"-jar","server.jar","nogui"\n\
-]\n\
-\n\
-def start():\n\
-    print(\"\\n🚀 Iniciando servidor Minecraft...\\n\")\n\
-    return subprocess.Popen(JAVA_FLAGS)\n\
-\n\
-while True:\n\
-    p = start()\n\
-    p.wait()\n\
-    print(\"⚠️ Servidor caiu! Reiniciando em 5s...\")\n\
-    time.sleep(5)\n\
-' > watchdog.py
+app = FastAPI()
 
-# Criar script principal
-RUN echo '\
-#!/bin/bash\n\
-clear\n\
-echo \"=====================================\"\n\
-echo \"   🟩 MINECRAFT DOCKER SERVER 🟩\"\n\
-echo \"=====================================\"\n\
-echo \"\"\n\
-echo \"Iniciando Playit...\"\n\
-./playit &\n\
-sleep 5\n\
-echo \"\"\n\
-echo \"🌍 Configure o túnel no link acima\"\n\
-echo \"Depois use o IP gerado para conectar\"\n\
-echo \"\"\n\
-echo \"=====================================\"\n\
-python3 watchdog.py\n\
-' > start.sh && chmod +x start.sh
+servers = {}
 
-EXPOSE 25565
+@app.get("/")
+def root():
+    return {"status": "online"}
 
-CMD ["bash", "start.sh"]
+@app.get("/servers")
+def list_servers():
+    data = []
+    for name, proc in servers.items():
+        running = proc.poll() is None
+        data.append({
+            "name": name,
+            "running": running,
+            "cpu": psutil.cpu_percent(),
+            "ram": psutil.virtual_memory().percent
+        })
+    return data
+
+@app.post("/create/{name}")
+def create_server(name: str):
+    os.makedirs(f"/servers/{name}", exist_ok=True)
+    return {"created": name}
+
+@app.post("/start/{name}")
+def start_server(name: str):
+    cmd = ["java", "-Xmx1G", "-Xms1G", "-jar", "server.jar", "nogui"]
+    proc = subprocess.Popen(cmd, cwd=f"/servers/{name}")
+    servers[name] = proc
+    return {"started": name}
+
+@app.post("/stop/{name}")
+def stop_server(name: str):
+    if name in servers:
+        servers[name].terminate()
+    return {"stopped": name}
+' > /app/backend/main.py
+
+# Frontend
+RUN mkdir -p /app/frontend
+RUN echo '
+<!DOCTYPE html>
+<html>
+<head>
+<title>Minecraft Panel</title>
+<style>
+body {margin:0; font-family:Arial; display:flex;}
+.sidebar {width:200px; background:#1e1e2f; color:white; height:100vh; padding:10px;}
+.content {flex:1; padding:20px;}
+.card {background:#2e2e3f; color:white; padding:10px; margin:10px; border-radius:8px;}
+</style>
+</head>
+<body>
+<div class="sidebar">Menu</div>
+<div class="sidebar">Servers</div>
+<div class="sidebar">Settings</div>
+<div class="content">
+<h1>Painel Minecraft</h1>
+<div id="servers"></div>
+</div>
+<script>
+async function load(){
+ let res = await fetch("/api/servers");
+ let data = await res.json();
+ let div = document.getElementById("servers");
+ div.innerHTML="";
+ data.forEach(s=>{
+   div.innerHTML += `<div class="card">${s.name} - ${s.running}</div>`;
+ });
+}
+load();
+</script>
+</body>
+</html>
+' > /app/frontend/index.html
+
+# Nginx config
+RUN rm /etc/nginx/sites-enabled/default
+RUN echo '
+server {
+    listen 8080;
+
+    location / {
+        root /app/frontend;
+        index index.html;
+    }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:8000/;
+    }
+}
+' > /etc/nginx/sites-enabled/mcpanel
+
+# Supervisor config
+RUN echo '
+[supervisord]
+nodaemon=true
+
+[program:backend]
+command=uvicorn main:app --host 0.0.0.0 --port 8000
+directory=/app/backend
+
+[program:nginx]
+command=nginx -g "daemon off;"
+' > /etc/supervisor/conf.d/supervisord.conf
+
+# Create servers directory
+RUN mkdir -p /servers
+
+# Auto account file
+RUN echo "admin:admin" > /app/account.txt
+
+# Expose port
+EXPOSE 8080
+
+# Start everything
+CMD ["/usr/bin/supervisord"]
