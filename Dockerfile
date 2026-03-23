@@ -1,39 +1,47 @@
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install dependencies
+# Instala dependências essenciais
 RUN apt-get update && apt-get install -y \
-    curl wget git unzip nano \
-    python3 python3-pip \
-    openjdk-8-jdk \
-    openjdk-11-jdk \
-    openjdk-17-jdk \
-    openjdk-21-jdk \
-    nodejs npm \
-    nginx \
-    supervisor \
-    && apt-get clean
+    curl wget git unzip nano python3 python3-pip \
+    openjdk-8-jdk openjdk-11-jdk openjdk-17-jdk openjdk-21-jdk \
+    nodejs npm nginx supervisor sudo unzip default-mysql-client \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Create app directory
+# Cria diretórios
 WORKDIR /app
+RUN mkdir -p /app/backend /app/frontend /servers
 
-# Backend (Python FastAPI)
-RUN pip3 install fastapi uvicorn psutil
+# Backend Python
+RUN pip3 install --no-cache-dir fastapi uvicorn psutil python-multipart
 
-# Create backend
-RUN mkdir -p /app/backend
-RUN echo '
-from fastapi import FastAPI
-import psutil, os, subprocess
+# Cria backend main.py
+RUN bash -c 'cat <<EOF > /app/backend/main.py
+from fastapi import FastAPI, UploadFile, File
+import psutil, os, subprocess, shutil, socket, json
 
 app = FastAPI()
-
 servers = {}
+account_file = "/app/account.txt"
+
+if not os.path.exists(account_file):
+    with open(account_file, "w") as f:
+        f.write("admin:admin")
+
+def get_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except:
+        return "127.0.0.1"
+    finally:
+        s.close()
 
 @app.get("/")
 def root():
-    return {"status": "online"}
+    return {"status": "online", "ip": get_ip()}
 
 @app.get("/servers")
 def list_servers():
@@ -55,7 +63,10 @@ def create_server(name: str):
 
 @app.post("/start/{name}")
 def start_server(name: str):
-    cmd = ["java", "-Xmx1G", "-Xms1G", "-jar", "server.jar", "nogui"]
+    jar_path = f"/servers/{name}/server.jar"
+    if not os.path.exists(jar_path):
+        return {"error": "server.jar not found"}
+    cmd = ["java", "-Xmx2G", "-Xms1G", "-jar", "server.jar", "nogui"]
     proc = subprocess.Popen(cmd, cwd=f"/servers/{name}")
     servers[name] = proc
     return {"started": name}
@@ -64,12 +75,19 @@ def start_server(name: str):
 def stop_server(name: str):
     if name in servers:
         servers[name].terminate()
-    return {"stopped": name}
-' > /app/backend/main.py
+        return {"stopped": name}
+    return {"error": "server not running"}
 
-# Frontend
-RUN mkdir -p /app/frontend
-RUN echo '
+@app.post("/upload/{name}")
+async def upload_file(name: str, file: UploadFile = File(...)):
+    path = f"/servers/{name}/{file.filename}"
+    with open(path, "wb") as f:
+        f.write(await file.read())
+    return {"uploaded": file.filename}
+EOF'
+
+# Cria frontend index.html
+RUN bash -c 'cat <<EOF > /app/frontend/index.html
 <!DOCTYPE html>
 <html>
 <head>
@@ -88,6 +106,7 @@ body {margin:0; font-family:Arial; display:flex;}
 <div class="content">
 <h1>Painel Minecraft</h1>
 <div id="servers"></div>
+<div id="ip"></div>
 </div>
 <script>
 async function load(){
@@ -96,53 +115,56 @@ async function load(){
  let div = document.getElementById("servers");
  div.innerHTML="";
  data.forEach(s=>{
-   div.innerHTML += `<div class="card">${s.name} - ${s.running}</div>`;
+   div.innerHTML += `<div class="card">\${s.name} - Online: \${s.running} - CPU: \${s.cpu}% - RAM: \${s.ram}%</div>`;
  });
+ let ipres = await fetch("/api/");
+ let ipdata = await ipres.json();
+ document.getElementById("ip").innerText = "IP: " + ipdata.ip;
 }
 load();
 </script>
 </body>
 </html>
-' > /app/frontend/index.html
+EOF'
 
-# Nginx config
+# Configura nginx
 RUN rm /etc/nginx/sites-enabled/default
-RUN echo '
+RUN bash -c 'cat <<EOF > /etc/nginx/sites-enabled/mcpanel
 server {
     listen 8080;
-
     location / {
         root /app/frontend;
         index index.html;
     }
-
     location /api/ {
         proxy_pass http://127.0.0.1:8000/;
     }
 }
-' > /etc/nginx/sites-enabled/mcpanel
+EOF'
 
-# Supervisor config
-RUN echo '
+# Configura supervisor
+RUN bash -c 'cat <<EOF > /etc/supervisor/conf.d/supervisord.conf
 [supervisord]
 nodaemon=true
 
 [program:backend]
 command=uvicorn main:app --host 0.0.0.0 --port 8000
 directory=/app/backend
+autostart=true
+autorestart=true
+stdout_logfile=/var/log/backend.log
+stderr_logfile=/var/log/backend_err.log
 
 [program:nginx]
 command=nginx -g "daemon off;"
-' > /etc/supervisor/conf.d/supervisord.conf
+autostart=true
+autorestart=true
+stdout_logfile=/var/log/nginx.log
+stderr_logfile=/var/log/nginx_err.log
+EOF'
 
-# Create servers directory
-RUN mkdir -p /servers
-
-# Auto account file
-RUN echo "admin:admin" > /app/account.txt
-
-# Expose port
+# Exposição da porta do painel
 EXPOSE 8080
 
-# Start everything
+# Inicializa supervisor
 CMD ["/usr/bin/supervisord"]
