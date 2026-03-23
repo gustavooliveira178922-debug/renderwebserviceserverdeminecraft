@@ -6,17 +6,17 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
     curl wget git unzip nano python3 python3-pip \
     openjdk-8-jdk openjdk-11-jdk openjdk-17-jdk openjdk-21-jdk \
-    nodejs npm nginx supervisor sudo unzip default-mysql-client \
+    nodejs npm nginx supervisor sudo unzip \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Diretórios de trabalho
+# Criação de diretórios
 WORKDIR /app
 RUN mkdir -p /app/backend /app/frontend /servers
 
 # Backend Python
 RUN pip3 install --no-cache-dir fastapi uvicorn psutil python-multipart
 
-# Cria backend main.py
+# Backend main.py
 RUN bash -c "cat <<'EOF' > /app/backend/main.py
 from fastapi import FastAPI, UploadFile, File
 import psutil, os, subprocess, socket
@@ -86,7 +86,7 @@ async def upload_file(name: str, file: UploadFile = File(...)):
     return {'uploaded': file.filename}
 EOF"
 
-# Cria frontend index.html
+# Frontend index.html
 RUN bash -c "cat <<'EOF' > /app/frontend/index.html
 <!DOCTYPE html>
 <html>
@@ -127,7 +127,7 @@ load();
 </html>
 EOF"
 
-# Configura nginx
+# Configura Nginx
 RUN rm /etc/nginx/sites-enabled/default
 RUN bash -c "cat <<'EOF' > /etc/nginx/sites-enabled/mcpanel
 server {
@@ -142,7 +142,7 @@ server {
 }
 EOF"
 
-# Configura supervisor
+# Configura Supervisor
 RUN bash -c "cat <<'EOF' > /etc/supervisor/conf.d/supervisord.conf
 [supervisord]
 nodaemon=true
@@ -163,7 +163,7 @@ stdout_logfile=/var/log/nginx.log
 stderr_logfile=/var/log/nginx_err.log
 EOF"
 
-# Expor porta do painel
+# Porta do painel
 EXPOSE 8080
 
 # Inicializa supervisor
